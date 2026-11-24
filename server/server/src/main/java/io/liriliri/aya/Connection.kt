@@ -15,8 +15,9 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.OutputStream
 
-class Connection(private val client: LocalSocket) : Thread() {
+class Connection(private val client: LocalSocket) : Runnable {
     private companion object {
         private const val TAG = "Aya.Connection"
         private var packageCache = JSONObject()
@@ -31,22 +32,61 @@ class Connection(private val client: LocalSocket) : Thread() {
     }
 
     override fun run() {
-        while (!isInterrupted && client.isConnected) {
-            try {
-                val request = Wire.Request.parseDelimitedFrom(client.inputStream)
-                val params = request.params.ifEmpty { "{}" }
-                handleRequest(request.id, request.method, params)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to handle request", e)
-                break
-            }
-        }
+        // NOTE: do not use LocalSocket.isConnected as the loop condition.
+        // On Android 5.x/6.x (:22/:23) a socket returned by LocalServerSocket.accept()
+        // reports isConnected == false, so the old `while (!isInterrupted &&
+        // client.isConnected)` loop body never ran and the connection was closed at once.
+        Log.i(TAG, "Client connected, isConnected=${safeIsConnected()}")
 
-        client.close()
-        Log.i(TAG, "Client disconnected")
+        try {
+            val input = client.inputStream
+            val output = client.outputStream
+
+            while (true) {
+                val request = try {
+                    Wire.Request.parseDelimitedFrom(input)
+                } catch (t: Throwable) {
+                    // Old Android/protobuf may surface errors as java.lang.Error
+                    // (NoClassDefFoundError, VerifyError, ...), which `catch (e: Exception)`
+                    // silently swallowed, killing the thread without any log.
+                    Log.e(TAG, "Failed to read request", t)
+                    break
+                }
+
+                if (request == null) {
+                    Log.i(TAG, "Client closed connection (EOF)")
+                    break
+                }
+
+                val params = if (request.params.isEmpty()) "{}" else request.params
+                try {
+                    handleRequest(request.id, request.method, params, output)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Failed to handle request", t)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Connection failed", t)
+        } finally {
+            try {
+                client.close()
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed to close client", t)
+            }
+            Log.i(TAG, "Client disconnected")
+        }
     }
 
-    private fun handleRequest(id: String, method: String, params: String) {
+    private fun safeIsConnected(): Boolean {
+        return try {
+            client.isConnected
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to read isConnected", t)
+            false
+        }
+    }
+
+    private fun handleRequest(id: String, method: String, params: String, output: OutputStream) {
         Log.i(TAG, "Request method: $method, params: $params")
 
         val result = JSONObject()
@@ -77,7 +117,9 @@ class Connection(private val client: LocalSocket) : Thread() {
 
         Log.i(TAG, "Response: $result")
         Wire.Response.newBuilder().setId(id).setResult(result.toString()).build()
-            .writeDelimitedTo(client.outputStream)
+            .writeDelimitedTo(output)
+        output.flush()
+        Log.i(TAG, "Response sent for $id")
     }
 
     private fun getVersion(): String {

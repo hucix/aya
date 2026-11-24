@@ -172,3 +172,123 @@ export type IpcGetFileUrl = (
   path: string,
   port?: number
 ) => Promise<string>
+
+export type PackageAction = 'install' | 'uninstall' | 'disable'
+export type PackageTaskStatus = 'success' | 'failure' | 'skipped'
+export type PackageState = 'system' | 'user' | 'missing'
+
+export interface IPackageTask {
+  deviceId: string
+  action: PackageAction
+  target: string
+  timeout?: number
+}
+
+export interface IPackageTaskResult {
+  deviceId: string
+  action: PackageAction
+  target: string
+  status: PackageTaskStatus
+  message: string
+  output: string
+  duration: number
+}
+
+export type IpcRunPackageTask = (
+  task: IPackageTask
+) => Promise<IPackageTaskResult>
+
+export type IpcGetPackageStates = (
+  deviceId: string,
+  packages: string[]
+) => Promise<Record<string, PackageState>>
+
+export type DiscoverSource = 'mdns' | 'scan'
+export type DiscoverState = 'found' | 'connecting' | 'connected' | 'failed'
+
+export interface IDiscoveredDevice {
+  id: string
+  host: string
+  port: number
+  name: string
+  serialno: string
+  androidVersion: string
+  sdkVersion: string
+  type: IDevice['type']
+  source: DiscoverSource
+  state: DiscoverState
+  message: string
+}
+
+export interface IDiscoverUpdate {
+  scanning: boolean
+  scanned: number
+  total: number
+  connected: number
+  failed: number
+  devices: IDiscoveredDevice[]
+  error?: string
+}
+
+export type IpcStartDiscover = (options?: {
+  concurrency?: number
+  timeout?: number
+}) => Promise<void>
+
+export type IpcStopDiscover = () => Promise<void>
+
+export type IpcGetDiscoverState = () => Promise<IDiscoverUpdate>
+
+export type DeviceConnectState =
+  | 'device'
+  | 'offline'
+  | 'unauthorized'
+  | 'failed'
+
+export interface IConnectDeviceResult {
+  state: DeviceConnectState
+  serialno: string
+  name: string
+  androidVersion: string
+  sdkVersion: string
+  message: string
+}
+
+export type IpcConnectDeviceChecked = (
+  host: string,
+  port?: number
+) => Promise<IConnectDeviceResult>
+
+export type IpcBeginInstallVerification = (deviceId: string) => Promise<string>
+
+export type IpcEndInstallVerification = (
+  deviceId: string,
+  original: string
+) => Promise<void>
+
+export interface IShellCommandResult {
+  code: number | null
+  stdout: string
+  stderr: string
+  timedOut: boolean
+}
+
+export type IpcRunShellCommand = (
+  deviceId: string,
+  command: string,
+  timeout?: number
+) => Promise<IShellCommandResult>
+
+export type IpcForwardPort = (
+  deviceId: string,
+  remote: string
+) => Promise<number>
+
+export interface IMinicapInfo {
+  width: number
+  height: number
+}
+
+export type IpcStartMinicap = (deviceId: string) => Promise<IMinicapInfo>
+
+export type IpcStopMinicap = (deviceId: string) => Promise<void>

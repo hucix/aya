@@ -24,11 +24,30 @@ class ScrcpyClient {
         ' '
       )}`
     )
-    socket.on('readable', () => {
-      const data = socket.read()
-      if (data) {
-        logger.info(data.toString())
+
+    // Wait until the server is actually listening before the renderer connects
+    // to the adb forward, otherwise the forward is closed immediately.
+    await new Promise<void>((resolve) => {
+      let output = ''
+      let done = false
+      const finish = () => {
+        if (!done) {
+          done = true
+          clearTimeout(timer)
+          resolve()
+        }
       }
+      const timer = setTimeout(finish, 8000)
+      socket.on('data', (data) => {
+        output += data.toString()
+        logger.info(data.toString())
+        if (/Device:/.test(output)) {
+          setTimeout(finish, 300)
+        }
+      })
+      socket.on('end', finish)
+      socket.on('error', finish)
+      socket.on('close', finish)
     })
   }
   async push() {

@@ -55,6 +55,8 @@ export default class ScrcpyClient extends Emitter {
   private readiness = new Readiness()
   private recorder = new Recorder()
   private keyboard = new Keyboard(this)
+  private fallbackTimer: ReturnType<typeof setTimeout> | null = null
+  private fallbackEmitted = false
   constructor(deviceId: string, options: ScrcpyOptions3_1) {
     super()
 
@@ -75,8 +77,24 @@ export default class ScrcpyClient extends Emitter {
   destroy() {
     logger.info('destroy')
 
+    this.clearFallbackTimer()
     if (this.server) {
       this.server.close()
+    }
+  }
+  private emitFallback(reason: unknown) {
+    if (this.fallbackEmitted) {
+      return
+    }
+    this.fallbackEmitted = true
+    this.clearFallbackTimer()
+    logger.warn('scrcpy unavailable, falling back to screencap', reason)
+    this.emit('fallback', reason)
+  }
+  private clearFallbackTimer() {
+    if (this.fallbackTimer) {
+      clearTimeout(this.fallbackTimer)
+      this.fallbackTimer = null
     }
   }
   startRecording() {
@@ -126,39 +144,118 @@ export default class ScrcpyClient extends Emitter {
   private start = async () => {
     const { deviceId, options } = this
 
-    const port = await main.reverseTcp(
-      this.deviceId,
-      `localabstract:scrcpy_${lpad(options.value.scid as string, 8, '0')}`
-    )
+    try {
+      this.fallbackTimer = setTimeout(() => {
+        if (!this.video) {
+          this.emitFallback(new Error('scrcpy video stream timed out'))
+        }
+      }, 8000)
 
-    const server = node.createServer(async (socket) => {
-      // video socket is the first connection
-      if (!this.video) {
-        this.video = {}
-        this.createVideo(socketToReadableStream(socket))
-        socket.on('close', () => this.emit('close'))
-        return
+      if (options.value.tunnelForward) {
+        await this.startForward(deviceId)
+      } else {
+        const port = await main.reverseTcp(
+          this.deviceId,
+          `localabstract:scrcpy_${lpad(options.value.scid as string, 8, '0')}`
+        )
+
+        const server = node.createServer(async (socket) => {
+          // video socket is the first connection
+          if (!this.video) {
+            this.video = {}
+            this.createVideo(socketToReadableStream(socket))
+            socket.on('close', () => this.emit('close'))
+            return
+          }
+
+          // audio socket and control socket orders are not guaranteed, need to detect
+          let isAudio = false
+          this.detectAudioStream(socketToReadableStream(socket)).then(
+            (value) => {
+              // never resolve if it's control socket
+              if (value.audio) {
+                isAudio = true
+                this.createAudio(value.stream)
+              }
+            }
+          )
+          sleep(1000).then(() => {
+            if (!isAudio) {
+              this.createControl(socketToReadableWritablePair(socket))
+            }
+          })
+        })
+        server.listen(port)
+        this.server = server
+
+        await main.startScrcpy(deviceId, options.serialize())
       }
-
-      // audio socket and control socket orders are not guaranteed, need to detect
-      let isAudio = false
-      this.detectAudioStream(socketToReadableStream(socket)).then((value) => {
-        // never resolve if it's control socket
-        if (value.audio) {
-          isAudio = true
-          this.createAudio(value.stream)
+    } catch (e) {
+      this.emitFallback(e)
+    }
+  }
+  private connectSocket(port: number): Promise<any> {
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true
+          reject(new Error('adb forward connect timed out'))
         }
-      })
-      sleep(1000).then(() => {
-        if (!isAudio) {
-          this.createControl(socketToReadableWritablePair(socket))
+      }, 1000)
+      node.connect(port, (socket) => {
+        if (settled) {
+          return
         }
+        settled = true
+        clearTimeout(timer)
+        resolve(socket)
       })
     })
-    server.listen(port)
-    this.server = server
+  }
+  private async connectWithRetry(port: number) {
+    let lastError: unknown
+    for (let i = 0; i < 10; i++) {
+      try {
+        return await this.connectSocket(port)
+      } catch (e) {
+        lastError = e
+        await sleep(300)
+      }
+    }
+    throw lastError || new Error('adb forward connect failed')
+  }
+  // Reverse tunnels are broken on some Allwinner adbd builds, so scrcpy is
+  // started with tunnel_forward and the three streams are connected by the host.
+  private async startForward(deviceId: string) {
+    const { options } = this
+    const remote = `localabstract:scrcpy_${lpad(
+      options.value.scid as string,
+      8,
+      '0'
+    )}`
+    const port = await main.forwardPort(deviceId, remote)
 
-    main.startScrcpy(deviceId, options.serialize())
+    await main.startScrcpy(deviceId, options.serialize())
+    await sleep(300)
+
+    const audio = !!options.value.audio
+    const videoSocket = await this.connectWithRetry(port)
+    this.video = {}
+    this.createVideo(socketToReadableStream(videoSocket)).catch((e) =>
+      this.emitFallback(e)
+    )
+    videoSocket.on('close', () =>
+      this.emitFallback(new Error('scrcpy video socket closed'))
+    )
+
+    if (audio) {
+      const audioSocket = await this.connectWithRetry(port)
+      this.createAudio(socketToReadableStream(audioSocket))
+    }
+
+    const controlSocket = await this.connectWithRetry(port)
+    this.createControl(socketToReadableWritablePair(controlSocket))
   }
   private async detectAudioStream(stream: ReadableStream<Uint8Array>) {
     let isAudio = false
@@ -203,6 +300,8 @@ export default class ScrcpyClient extends Emitter {
   }
   private async createVideo(videoStream: ReadableStream<Uint8Array>) {
     logger.info('video stream connected')
+
+    this.clearFallbackTimer()
 
     const { options } = this
 

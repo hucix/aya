@@ -17,7 +17,12 @@ import fs from 'fs-extra'
 import { getSettingsStore } from '../store'
 import childProcess from 'node:child_process'
 import contain from 'licia/contain'
-import { IpcGetProcesses, IpcReverseTcp, IProcess } from 'common/types'
+import {
+  IpcForwardPort,
+  IpcGetProcesses,
+  IpcReverseTcp,
+  IProcess,
+} from 'common/types'
 
 const logger = log('adbBase')
 
@@ -107,6 +112,7 @@ export async function init(c: Client) {
   client = c
 
   handleEvent('reverseTcp', reverseTcp)
+  handleEvent('forwardPort', forwardPort)
   handleEvent('getProcesses', getProcesses)
 }
 
@@ -145,6 +151,21 @@ export async function forwardTcp(deviceId: string, remote: string) {
   const port = await getPort()
   const local = `tcp:${port}`
   await device.forward(local, remote)
+
+  return port
+}
+
+export const forwardPort: IpcForwardPort = async function (deviceId, remote) {
+  const port = await getPort()
+  const result = await execAdb(['forward', `tcp:${port}`, remote], {
+    serial: deviceId,
+    timeout: 8000,
+  })
+  if (result.timedOut || result.code !== 0) {
+    throw new Error(
+      `adb forward failed: ${result.stderr || result.stdout}`.trim()
+    )
+  }
 
   return port
 }
@@ -191,38 +212,134 @@ export function getAdbPath() {
   return bin
 }
 
-export function spawnAdb(args: string[]): Promise<{
+export interface IExecAdbOptions {
+  // Target a specific device with `-s`, required when multiple devices are connected.
+  serial?: string
+  // Kill the adb process when it exceeds the given milliseconds.
+  timeout?: number
+  // Keep the legacy shell behaviour for existing callers.
+  shell?: boolean
+  // Kill the adb process after matching output stays on screen for stallTimeout.
+  stallPattern?: RegExp
+  stallTimeout?: number
+  // Abort the running command (for example when the device went offline).
+  signal?: AbortSignal
+}
+
+export interface IExecAdbResult {
   stdout: string
   stderr: string
   code: number | null
-}> {
+  timedOut: boolean
+  stalled: boolean
+  aborted: boolean
+}
+
+export function execAdb(
+  args: string[],
+  options: IExecAdbOptions = {}
+): Promise<IExecAdbResult> {
   const bin = getAdbPath()
+  const adbArgs = options.serial ? ['-s', options.serial, ...args] : args
+  const timeout = options.timeout || 0
 
   return new Promise((resolve, reject) => {
-    const cp = childProcess.spawn(bin, args, {
+    const cp = childProcess.spawn(bin, adbArgs, {
       env: { ...process.env },
-      shell: true,
+      shell: !!options.shell,
+      windowsHide: true,
     })
 
     let stdout = ''
     let stderr = ''
+    let timedOut = false
+    let stalled = false
+    let aborted = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let stallTimer: ReturnType<typeof setTimeout> | null = null
+
+    const onAbort = () => {
+      aborted = true
+      cp.kill()
+    }
+    if (options.signal) {
+      if (options.signal.aborted) {
+        onAbort()
+      } else {
+        options.signal.addEventListener('abort', onAbort)
+      }
+    }
+
+    if (timeout > 0) {
+      timer = setTimeout(() => {
+        timedOut = true
+        cp.kill()
+      }, timeout)
+    }
+
+    const checkStall = (data: string) => {
+      if (
+        stalled ||
+        stallTimer ||
+        !options.stallPattern ||
+        !options.stallTimeout
+      ) {
+        return
+      }
+      if (options.stallPattern.test(data)) {
+        stallTimer = setTimeout(() => {
+          stalled = true
+          cp.kill()
+        }, options.stallTimeout)
+      }
+    }
 
     cp.stdout?.on('data', (data) => {
       stdout += data.toString()
+      checkStall(data.toString())
     })
 
     cp.stderr?.on('data', (data) => {
       stderr += data.toString()
+      checkStall(data.toString())
     })
 
     cp.on('error', (err) => {
+      if (timer) {
+        clearTimeout(timer)
+      }
+      if (stallTimer) {
+        clearTimeout(stallTimer)
+      }
+      if (options.signal) {
+        options.signal.removeEventListener('abort', onAbort)
+      }
       reject(err)
     })
 
     cp.on('close', (code) => {
-      resolve({ stdout, stderr, code })
+      if (timer) {
+        clearTimeout(timer)
+      }
+      if (stallTimer) {
+        clearTimeout(stallTimer)
+      }
+      if (options.signal) {
+        options.signal.removeEventListener('abort', onAbort)
+      }
+      resolve({ stdout, stderr, code, timedOut, stalled, aborted })
     })
   })
+}
+
+export async function spawnAdb(args: string[]): Promise<{
+  stdout: string
+  stderr: string
+  code: number | null
+}> {
+  const { stdout, stderr, code } = await execAdb(args, { shell: true })
+
+  return { stdout, stderr, code }
 }
 
 export async function isRooted(deviceId: string): Promise<boolean> {

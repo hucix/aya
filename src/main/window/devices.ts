@@ -1,6 +1,7 @@
 import { BrowserWindow } from 'electron'
 import { getDevicesStore } from '../lib/store'
 import * as window from 'share/main/lib/window'
+import * as discovery from '../lib/discovery'
 import once from 'licia/once'
 import { handleEvent } from 'share/main/lib/util'
 import { IpcGetStore, IpcSetStore } from 'share/common/types'
@@ -34,6 +35,7 @@ export function showWin() {
 }
 
 const initIpc = once(() => {
+  discovery.init()
   handleEvent('setDevicesStore', <IpcSetStore>(
     ((name, val) => store.set(name, val))
   ))

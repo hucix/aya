@@ -13,13 +13,16 @@ android {
     namespace 'io.liriliri.aya'
 
     compileSdk = 34
+    // AGP 7.4.2 defaults to build-tools 30.0.3; pin the toolchain version used here.
+    buildToolsVersion = '34.0.0'
 
     def pkgFilePath = "$rootDir/../package.json"
     def pkgFile = new File(pkgFilePath)
     def pkgJson = new groovy.json.JsonSlurper().parseText(pkgFile.text)
 
     defaultConfig {
-        minSdk 23
+        // Android 5.0+ so the same dex runs on API 21/22 (Android 5.0/5.1) devices.
+        minSdk 21
         versionCode 1
         versionName pkgJson.version
     }

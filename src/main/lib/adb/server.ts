@@ -13,6 +13,7 @@ import isEmpty from 'licia/isEmpty'
 import isUndef from 'licia/isUndef'
 import each from 'licia/each'
 import startWith from 'licia/startWith'
+import trim from 'licia/trim'
 import extend from 'licia/extend'
 import toNum from 'licia/toNum'
 
@@ -37,6 +38,7 @@ class AyaClient {
 
     const id = uuid()
 
+    logger.debug('send', method, !!this.socket)
     this.socket.write(
       wire.io.liriliri.aya.Request.encodeDelimited({
         id,
@@ -54,6 +56,7 @@ class AyaClient {
     try {
       const device = client.getDevice(this.deviceId)
       const socket = await device.openLocal('localabstract:aya')
+      logger.debug('openLocal ok', this.deviceId)
       let buf = Buffer.alloc(0)
       socket.on('readable', () => {
         const newBuf = socket.read()
@@ -73,9 +76,14 @@ class AyaClient {
           // ignore
         }
       })
-      socket.on('end', () => (this.socket = null))
+      socket.on('error', (e) => logger.error('socket error', e))
+      socket.on('end', () => {
+        logger.debug('socket end')
+        this.socket = null
+      })
       this.socket = socket
-    } catch {
+    } catch (e) {
+      logger.error('connect failed', e)
       if (tryStart) {
         await this.push()
         await this.start()
@@ -114,38 +122,152 @@ async function getAyaClient(deviceId: string): Promise<AyaClient> {
   return ayaClient
 }
 
+const PACKAGE_INFO_TIMEOUT = 5000
+const ayaServerUnavailable = new Set<string>()
+
+function withTimeout<T>(promise: Promise<T>, timeout: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('aya server request timed out')),
+      timeout
+    )
+    promise.then(
+      (val) => {
+        clearTimeout(timer)
+        resolve(val)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      }
+    )
+  })
+}
+
+// Some old Android devices (5.x/6.x) cannot complete the aya.dex handshake.
+// Fall back to plain adb so the app list is still usable, without icons.
+async function getPackageInfosFromShell(
+  deviceId: string,
+  packageNames: string[]
+): Promise<IPackageInfo[]> {
+  const [pathOutput, systemOutput] = (await shell(deviceId, [
+    'pm list packages -f',
+    'pm list packages -s',
+  ])) as string[]
+
+  const apkPaths: types.PlainObj<string> = {}
+  each(pathOutput.split('\n'), (line) => {
+    line = trim(line)
+    if (!startWith(line, 'package:')) {
+      return
+    }
+    const rest = line.slice(8)
+    const idx = rest.lastIndexOf('=')
+    if (idx > 0) {
+      apkPaths[rest.slice(idx + 1)] = rest.slice(0, idx)
+    }
+  })
+
+  const systemPackages: types.PlainObj<boolean> = {}
+  each(systemOutput.split('\n'), (line) => {
+    line = trim(line)
+    if (startWith(line, 'package:')) {
+      systemPackages[line.slice(8)] = true
+    }
+  })
+
+  let diskStats: types.PlainObj<{
+    appSize: number
+    dataSize: number
+    cacheSize: number
+  }> = {}
+  try {
+    diskStats = await getPackageDiskStats(deviceId)
+  } catch {
+    // Disk stats are optional.
+  }
+
+  return packageNames.map((packageName) => {
+    const stats = diskStats[packageName] || {
+      appSize: 0,
+      dataSize: 0,
+      cacheSize: 0,
+    }
+
+    return {
+      icon: '',
+      label: packageName,
+      enabled: true,
+      packageName,
+      versionName: '',
+      apkPath: apkPaths[packageName] || '',
+      apkSize: 0,
+      system: !!systemPackages[packageName],
+      firstInstallTime: 0,
+      lastUpdateTime: 0,
+      dataSize: stats.dataSize,
+      cacheSize: stats.cacheSize,
+      appSize: stats.appSize,
+      signatures: [],
+    } as IPackageInfo
+  })
+}
+
 const getPackageInfos: IpcGetPackageInfos = singleton(async function (
   deviceId,
   packageNames
 ) {
-  const client = await getAyaClient(deviceId)
-  const result = await client.sendMessage('getPackageInfos', {
-    packageNames,
-  })
-  const { packageInfos } = result
-  const serverPort = await getFileServerPort(deviceId)
-  if (!isEmpty(packageInfos)) {
-    for (let i = 0, len = packageInfos.length; i < len; i++) {
-      const info: IPackageInfo = packageInfos[i]
-      if (info.icon) {
-        info.icon = await getFileUrl(deviceId, info.icon, serverPort)
-      }
+  if (ayaServerUnavailable.has(deviceId)) {
+    return getPackageInfosFromShell(deviceId, packageNames)
+  }
+
+  try {
+    const client = await getAyaClient(deviceId)
+    const result = await withTimeout(
+      client.sendMessage('getPackageInfos', {
+        packageNames,
+      }),
+      PACKAGE_INFO_TIMEOUT
+    )
+    const { packageInfos } = result
+
+    let serverPort = 0
+    try {
+      serverPort = await withTimeout(getFileServerPort(deviceId), 5000)
+    } catch {
+      // Icons are optional.
     }
-    if (isUndef(packageInfos[0].appSize)) {
-      const packageDiskStats = await getPackageDiskStats(deviceId)
+
+    if (!isEmpty(packageInfos)) {
       for (let i = 0, len = packageInfos.length; i < len; i++) {
         const info: IPackageInfo = packageInfos[i]
-        if (info.packageName && packageDiskStats[info.packageName]) {
-          extend(info, packageDiskStats[info.packageName])
-        } else {
-          info.appSize = 0
-          info.dataSize = 0
-          info.cacheSize = 0
+        if (info.icon) {
+          info.icon = serverPort
+            ? await getFileUrl(deviceId, info.icon, serverPort)
+            : ''
+        }
+      }
+      if (isUndef(packageInfos[0].appSize)) {
+        const packageDiskStats = await getPackageDiskStats(deviceId)
+        for (let i = 0, len = packageInfos.length; i < len; i++) {
+          const info: IPackageInfo = packageInfos[i]
+          if (info.packageName && packageDiskStats[info.packageName]) {
+            extend(info, packageDiskStats[info.packageName])
+          } else {
+            info.appSize = 0
+            info.dataSize = 0
+            info.cacheSize = 0
+          }
         }
       }
     }
+
+    return packageInfos
+  } catch (e) {
+    ayaServerUnavailable.add(deviceId)
+    logger.warn('getPackageInfos fallback to adb', deviceId, e)
+    return getPackageInfosFromShell(deviceId, packageNames)
   }
-  return packageInfos
 })
 
 const getPackageDiskStats = async function (deviceId: string) {

@@ -14,3 +14,35 @@
     outline: none !important;
   }
 }
+
+.frames {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.frame-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+
+.fallback-tip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: #ccc;
+  text-align: center;
+  background: rgba(0, 0, 0, 0.6);
+}

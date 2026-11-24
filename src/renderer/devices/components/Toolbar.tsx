@@ -4,6 +4,7 @@ import LunaToolbar, {
   LunaToolbarInput,
   LunaToolbarSeparator,
   LunaToolbarSpace,
+  LunaToolbarText,
 } from 'luna-toolbar/react'
 import Style from './Toolbar.module.scss'
 import toNum from 'licia/toNum'
@@ -19,7 +20,7 @@ import { useState } from 'react'
 
 export default observer(function Toolbar() {
   const [codePairModalVisible, setCodePairModalVisible] = useState(false)
-  const { device, remoteDevices } = store
+  const { device, remoteDevices, discover } = store
 
   const wirelessDisabled =
     !device ||
@@ -27,6 +28,18 @@ export default observer(function Toolbar() {
     some(remoteDevices, (d) => {
       return d.serialno === device.serialno && d.type !== 'offline'
     })
+
+  async function toggleScan() {
+    try {
+      if (discover.scanning) {
+        await main.stopDiscover()
+      } else {
+        await main.startDiscover()
+      }
+    } catch {
+      notify(t('commonErr'), { icon: 'error' })
+    }
+  }
 
   return (
     <>
@@ -47,15 +60,10 @@ export default observer(function Toolbar() {
         />
         <LunaToolbarButton
           onClick={async () => {
-            try {
-              if (store.port) {
-                await main.connectDevice(store.ip, toNum(store.port))
-              } else {
-                await main.connectDevice(store.ip)
-              }
-            } catch {
-              notify(t('connectErr'), { icon: 'error' })
-            }
+            await store.connectAddress(
+              store.ip,
+              store.port ? toNum(store.port) : undefined
+            )
           }}
           state="hover"
           disabled={isStrBlank(store.ip)}
@@ -68,6 +76,37 @@ export default observer(function Toolbar() {
           state="hover"
         >
           {t('pair')}
+        </LunaToolbarButton>
+        <LunaToolbarSeparator />
+        <LunaToolbarButton onClick={toggleScan} state="hover">
+          {discover.scanning ? t('stopScan') : t('scanDevices')}
+        </LunaToolbarButton>
+        {discover.scanning ? (
+          <LunaToolbarText
+            text={t('scanningDevices', {
+              scanned: discover.scanned,
+              total: discover.total,
+            })}
+          />
+        ) : null}
+        <LunaToolbarSeparator />
+        <LunaToolbarButton
+          onClick={() => store.selectAllDevices()}
+          state="hover"
+        >
+          {store.isAllSelected() ? t('unselectAll') : t('selectAll')}
+        </LunaToolbarButton>
+        <LunaToolbarButton
+          onClick={() => {
+            if (store.batchVisible) {
+              store.closeBatch()
+            } else {
+              store.openBatch()
+            }
+          }}
+          state={store.batchVisible ? 'active' : 'hover'}
+        >
+          {store.batchVisible ? t('backToDevices') : t('batchOperation')}
         </LunaToolbarButton>
         <LunaToolbarSpace />
         <ToolbarIcon

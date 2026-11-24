@@ -5,6 +5,7 @@ import once from 'licia/once'
 import { handleEvent } from 'share/main/lib/util'
 import { IpcGetStore, IpcSetStore } from 'share/common/types'
 import { IpcSetScreencastAlwaysOnTop } from 'common/types'
+import * as minicap from '../lib/adb/minicap'
 
 const store = getScreencastStore()
 
@@ -29,6 +30,7 @@ export function showWin() {
   win.on('close', () => {
     win?.destroy()
     win = null
+    minicap.stopAll()
     const mainWin = window.getWin('main')
     if (mainWin) {
       mainWin.show()

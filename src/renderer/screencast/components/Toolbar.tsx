@@ -19,6 +19,7 @@ export default observer(function Toolbar() {
   const [settingsModalVisiable, setSettingsModalVisiable] = useState(false)
 
   const { device, scrcpyClient } = store
+  const scrcpyReady = store.mode === 'scrcpy'
 
   async function captureScreenshot() {
     const video = await scrcpyClient.getVideo()
@@ -77,11 +78,17 @@ export default observer(function Toolbar() {
           title={t('appSwitch')}
           onClick={inputKey(AndroidKeyCode.AndroidAppSwitch)}
         />
-        <ToolbarIcon icon="text" title={t('inputText')} onClick={injectText} />
+        <ToolbarIcon
+          icon="text"
+          title={t('inputText')}
+          disabled={!scrcpyReady}
+          onClick={injectText}
+        />
         <LunaToolbarSeparator />
         <ToolbarIcon
           icon={store.screenOff ? 'screen-on' : 'screen-off'}
           title={t(store.screenOff ? 'screenOn' : 'screenOff')}
+          disabled={!scrcpyReady}
           onClick={() => {
             if (store.screenOff) {
               store.turnOnScreen()
@@ -93,12 +100,14 @@ export default observer(function Toolbar() {
         <ToolbarIcon
           icon="camera"
           title={t('screenshot')}
+          disabled={!scrcpyReady}
           onClick={captureScreenshot}
         />
         <ToolbarIcon
           icon="video-recorder"
           title={t('screenRecording')}
           state={store.recording ? 'hover' : ''}
+          disabled={!scrcpyReady}
           onClick={() => {
             if (store.recording) {
               store.stopRecording()
@@ -119,6 +128,7 @@ export default observer(function Toolbar() {
         <ToolbarIcon
           icon="fullscreen"
           title={t('fullscreen')}
+          disabled={!scrcpyReady}
           onClick={toggleFullscreen}
         />
         <LunaToolbarSpace />

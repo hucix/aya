@@ -20,7 +20,7 @@ import { getSettingsStore } from './store'
 import isWindows from 'licia/isWindows'
 import isEmpty from 'licia/isEmpty'
 import * as base from './adb/base'
-import { shell, getAdbPath, spawnAdb, isRooted } from './adb/base'
+import { shell, getAdbPath, spawnAdb, isRooted, execAdb } from './adb/base'
 import * as logcat from './adb/logcat'
 import * as shellAdb from './adb/shell'
 import * as server from './adb/server'
@@ -30,10 +30,15 @@ import * as file from './adb/file'
 import * as fps from './adb/fps'
 import * as webview from './adb/webview'
 import * as port from './adb/port'
+import * as minicap from './adb/minicap'
+import * as deviceTerminal from './adb/terminal'
 import { getCpuLoads, getCpus, getCpuTemperature } from './adb/cpu'
 import log from 'share/common/log'
 import {
+  IConnectDeviceResult,
+  IDevice,
   IpcConnectDevice,
+  IpcConnectDeviceChecked,
   IpcDisconnectDevice,
   IpcDumpWindowHierarchy,
   IpcGetDevices,
@@ -52,7 +57,32 @@ const settingsStore = getSettingsStore()
 
 let client: Client
 
-const getDevices: IpcGetDevices = async function () {
+function getDeviceName(properties: types.PlainObj<string>) {
+  let name = `${properties['ro.product.manufacturer']} ${properties['ro.product.model']}`
+  const marketName = getMarketName(properties)
+  if (marketName) {
+    name = marketName
+  }
+
+  return name
+}
+
+function buildDevice(
+  id: string,
+  type: IDevice['type'],
+  properties: types.PlainObj<string>
+): IDevice {
+  return {
+    id,
+    type,
+    serialno: properties['ro.serialno'] || '',
+    name: getDeviceName(properties),
+    androidVersion: properties['ro.build.version.release'],
+    sdkVersion: properties['ro.build.version.sdk'],
+  }
+}
+
+export const getDevices: IpcGetDevices = async function () {
   let devices = await client.listDevices()
   devices = filter(
     devices,
@@ -63,22 +93,22 @@ const getDevices: IpcGetDevices = async function () {
     map(devices, async (device: Device) => {
       const properties = await client.getDevice(device.id).getProperties()
 
-      let name = `${properties['ro.product.manufacturer']} ${properties['ro.product.model']}`
-      const marketName = getMarketName(properties)
-      if (marketName) {
-        name = marketName
-      }
-
-      return {
-        id: device.id,
-        type: device.type,
-        serialno: properties['ro.serialno'] || '',
-        name,
-        androidVersion: properties['ro.build.version.release'],
-        sdkVersion: properties['ro.build.version.sdk'],
-      }
+      return buildDevice(device.id, device.type, properties)
     })
   ).catch(() => [])
+}
+
+export async function getDeviceInfo(deviceId: string): Promise<IDevice | null> {
+  try {
+    const properties = await client.getDevice(deviceId).getProperties()
+    const type: IDevice['type'] = contain(deviceId, 'emulator-')
+      ? 'emulator'
+      : 'device'
+
+    return buildDevice(deviceId, type, properties)
+  } catch {
+    return null
+  }
 }
 
 async function getOverview(deviceId: string) {
@@ -296,8 +326,109 @@ function getPropValue(key: string, str: string) {
   return ''
 }
 
-const connectDevice: IpcConnectDevice = async function (host, port) {
+export const connectDevice: IpcConnectDevice = async function (host, port) {
   await client.connect(host, port)
+}
+
+// Connect and verify the adb transport state. A stale `offline` transport is
+// recovered by reconnecting once, which is what usually happens after a device
+// slept or its adb daemon restarted.
+export const connectDeviceChecked: IpcConnectDeviceChecked = async function (
+  host,
+  port
+) {
+  const id = port ? `${host}:${port}` : host
+  let message = ''
+  let connectFailed = false
+
+  async function tryConnect() {
+    try {
+      await execAdb(['disconnect', id], { timeout: 5000 })
+    } catch {
+      // There may be no previous connection.
+    }
+    try {
+      const result = await execAdb(['connect', id], { timeout: 8000 })
+      const text = `${result.stdout}\n${result.stderr}`.trim()
+      if (result.timedOut) {
+        connectFailed = true
+        message = 'adb connect timed out'
+      } else if (
+        /failed to connect|unable to connect|cannot connect|connection refused/i.test(
+          text
+        )
+      ) {
+        connectFailed = true
+        message = text
+      } else if (text) {
+        message = text
+      }
+    } catch (e) {
+      connectFailed = true
+      message = e instanceof Error ? e.message : String(e)
+    }
+  }
+
+  async function waitForDevice(timeout: number) {
+    const start = Date.now()
+    while (Date.now() - start < timeout) {
+      try {
+        const devices = await client.listDevices()
+        const device = devices.find((item) => item.id === id)
+        if (device) {
+          return device
+        }
+      } catch {
+        // adb server may still be starting, retry.
+      }
+      await sleep(300)
+    }
+
+    return null
+  }
+
+  await tryConnect()
+  let device = await waitForDevice(4000)
+  if (device && device.type === 'offline') {
+    await tryConnect()
+    device = await waitForDevice(4000)
+  } else if (!device && !connectFailed) {
+    await tryConnect()
+    device = await waitForDevice(4000)
+  }
+
+  const ret = (
+    state: IConnectDeviceResult['state'],
+    info: IDevice | null,
+    msg: string
+  ): IConnectDeviceResult => ({
+    state,
+    serialno: info ? info.serialno : '',
+    name: info ? info.name : id,
+    androidVersion: info ? info.androidVersion : '',
+    sdkVersion: info ? info.sdkVersion : '',
+    message: msg,
+  })
+
+  if (!device) {
+    return ret('failed', null, message || 'Device not found after adb connect')
+  }
+  if (device.type === 'unauthorized') {
+    return ret(
+      'unauthorized',
+      null,
+      'Device unauthorized, please confirm the debugging prompt on the device'
+    )
+  }
+  if (device.type !== 'device' && device.type !== 'emulator') {
+    return ret(
+      'offline',
+      null,
+      message || `adb reported device state: ${device.type}`
+    )
+  }
+
+  return ret('device', await getDeviceInfo(id), '')
 }
 
 const disconnectDevice: IpcDisconnectDevice = async function (host, port) {
@@ -416,6 +547,8 @@ export async function init() {
   fps.init()
   webview.init()
   port.init(client)
+  minicap.init()
+  deviceTerminal.init()
 
   handleEvent('getDevices', getDevices)
   handleEvent('getOverview', getOverview)
@@ -425,6 +558,7 @@ export async function init() {
   handleEvent('getPerformance', getPerformance)
   handleEvent('getUptime', getUptime)
   handleEvent('connectDevice', connectDevice)
+  handleEvent('connectDeviceChecked', connectDeviceChecked)
   handleEvent('disconnectDevice', disconnectDevice)
   handleEvent('inputKey', inputKey)
   handleEvent('openAdbCli', openAdbCli)
